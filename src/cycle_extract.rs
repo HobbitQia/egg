@@ -417,35 +417,48 @@ where
 /// and tries to minimize the total count of nodes on cycles
 /// 
 /// Key design choices:
-/// - Only nodes that are on cycles have cost = 1
-/// - Nodes NOT on cycles have cost = 0
+/// - **Phase 1**: Minimize cycle_node_count (nodes ON cycles have cost = 1)
+/// - **Phase 2**: After fixing cycle nodes, minimize total area for non-cycle nodes
 /// - Cycles are created by ctrl_mov backward edges
 /// - Cost aggregation: cost = sum(child_costs) + self_cost
-/// - Goal: minimize the total number of nodes on cycles
-pub struct MinCycleExtractor<'a, L: Language, N: Analysis<L>> {
+/// 
+/// The area cost is provided by an external function and only applies to
+/// nodes that are NOT on cycles. This allows the extractor to:
+/// 1. First minimize the number of nodes on cycles (critical path)
+/// 2. Then optimize for area among equivalent choices for non-cycle nodes
+pub struct MinCycleExtractor<'a, L: Language, N: Analysis<L>, F: Fn(&L) -> usize> {
     egraph: &'a EGraph<L, N>,
     costs: HashMap<Id, (CycleCost, L)>,
     cycle_info: HashMap<Id, CycleInfo>,
+    /// Function to get the area cost of a node (only used for non-cycle nodes)
+    area_fn: F,
 }
 
-/// Cost structure that tracks nodes on cycles and total size
+/// Cost structure that tracks nodes on cycles and area for non-cycle nodes
+/// 
+/// Comparison order:
+/// 1. cycle_node_count (primary) - minimize nodes on cycles
+/// 2. off_cycle_area (secondary) - minimize area for non-cycle nodes
+/// 3. ast_size (tertiary) - tie-breaking
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CycleCost {
     /// Number of nodes on cycles (the key metric to minimize)
     pub cycle_node_count: usize,
+    /// Total area of nodes NOT on cycles (secondary metric)
+    pub off_cycle_area: usize,
     /// Total AST size (for tie-breaking)
     pub ast_size: usize,
 }
 
 impl CycleCost {
-    /// Create a new CycleCost with specified cycle_node_count and ast_size
-    pub fn new(cycle_node_count: usize, ast_size: usize) -> Self {
-        CycleCost { cycle_node_count, ast_size }
+    /// Create a new CycleCost with specified values
+    pub fn new(cycle_node_count: usize, off_cycle_area: usize, ast_size: usize) -> Self {
+        CycleCost { cycle_node_count, off_cycle_area, ast_size }
     }
 
     /// Create a zero-cost CycleCost
     pub fn zero() -> Self {
-        CycleCost { cycle_node_count: 0, ast_size: 0 }
+        CycleCost { cycle_node_count: 0, off_cycle_area: 0, ast_size: 0 }
     }
 }
 
@@ -457,41 +470,51 @@ impl PartialOrd for CycleCost {
 
 impl Ord for CycleCost {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Primary: minimize cycle node count
-        // Secondary: minimize AST size (for tie-breaking)
+        // Phase 1: minimize cycle node count (critical - nodes ON cycles)
+        // Phase 2: minimize off-cycle area (secondary - nodes NOT on cycles)
+        // Phase 3: minimize AST size (tie-breaking)
         match self.cycle_node_count.cmp(&other.cycle_node_count) {
-            std::cmp::Ordering::Equal => self.ast_size.cmp(&other.ast_size),
+            std::cmp::Ordering::Equal => {
+                match self.off_cycle_area.cmp(&other.off_cycle_area) {
+                    std::cmp::Ordering::Equal => self.ast_size.cmp(&other.ast_size),
+                    other => other,
+                }
+            }
             other => other,
         }
     }
 }
 
-impl<'a, L, N> MinCycleExtractor<'a, L, N>
+impl<'a, L, N, F> MinCycleExtractor<'a, L, N, F>
 where
     L: Language,
     N: Analysis<L>,
+    F: Fn(&L) -> usize,
 {
-    /// Create a new MinCycleExtractor
+    /// Create a new MinCycleExtractor with a custom area function
     ///
     /// Arguments:
     /// - `egraph`: The e-graph to extract from
     /// - `is_back_edge`: Returns true for nodes that represent backward edges (ctrl_mov)
     ///                   These backward edges are used for cycle detection.
-    pub fn new<F>(egraph: &'a EGraph<L, N>, is_back_edge: F) -> Self
+    /// - `area_fn`: Returns the area cost of a node. This is only used for nodes
+    ///              that are NOT on cycles. For nodes on cycles, area is not considered.
+    pub fn new_with_area<G>(egraph: &'a EGraph<L, N>, is_back_edge: G, area_fn: F) -> Self
     where
-        F: Fn(&L) -> bool + Clone,
+        G: Fn(&L) -> bool + Clone,
     {
         let cycle_info = CycleCostFunction::detect_cycles(egraph, is_back_edge);
         let mut extractor = MinCycleExtractor {
             egraph,
             costs: HashMap::default(),
             cycle_info,
+            area_fn,
         };
         extractor.find_costs();
         extractor
     }
 
-    /// Find the best (minimum cycle nodes) represented RecExpr in the given e-class
+    /// Find the best (minimum cycle nodes, then minimum area) represented RecExpr in the given e-class
     pub fn find_best(&self, eclass: Id) -> (CycleCost, RecExpr<L>) {
         let (cost, root) = self.costs[&self.egraph.find(eclass)].clone();
         let expr = root.build_recexpr(|id| self.find_best_node(id).clone());
@@ -519,8 +542,8 @@ where
     }
 
     /// Calculate cost for a node
-    /// - Node on cycle: cost = sum(child_costs) + 1
-    /// - Node not on cycle: cost = sum(child_costs) + 0
+    /// - Node on cycle: cycle_node_count += 1, off_cycle_area += 0
+    /// - Node not on cycle: cycle_node_count += 0, off_cycle_area += area(node)
     fn node_total_cost(&self, node: &L, node_eclass: Id) -> Option<CycleCost>
     {
         let eg = self.egraph;
@@ -534,6 +557,7 @@ where
                 let child_cost = &costs[&eg.find(id)].0;
                 CycleCost {
                     cycle_node_count: acc.cycle_node_count + child_cost.cycle_node_count,
+                    off_cycle_area: acc.off_cycle_area + child_cost.off_cycle_area,
                     ast_size: acc.ast_size + child_cost.ast_size,
                 }
             });
@@ -545,12 +569,20 @@ where
                 .map(|info| info.on_cycle)
                 .unwrap_or(false);
             
-            // Nodes on cycles add 1 to cycle_node_count
-            // All nodes add 1 to ast_size
-            let self_cycle_cost = if on_cycle { 1 } else { 0 };
+            // Get area cost for this node
+            let node_area = (self.area_fn)(node);
+            
+            // Nodes on cycles: add 1 to cycle_node_count, 0 to area
+            // Nodes NOT on cycles: add 0 to cycle_node_count, area to off_cycle_area
+            let (self_cycle_cost, self_area_cost) = if on_cycle {
+                (1, 0)  // On cycle: count as cycle node, don't count area
+            } else {
+                (0, node_area)  // Not on cycle: don't count as cycle node, count area
+            };
             
             Some(CycleCost {
                 cycle_node_count: child_cost_sum.cycle_node_count + self_cycle_cost,
+                off_cycle_area: child_cost_sum.off_cycle_area + self_area_cost,
                 ast_size: child_cost_sum.ast_size + 1,
             })
         } else {
@@ -609,6 +641,27 @@ where
             .min_by(|a, b| cmp_opt(&a.0, &b.0))
             .unwrap_or_else(|| panic!("Can't extract, eclass is empty: {:#?}", eclass));
         cost.map(|c| (c, node.clone()))
+    }
+}
+
+/// Convenience constructor for MinCycleExtractor with default area = 1 for all nodes
+impl<'a, L, N> MinCycleExtractor<'a, L, N, fn(&L) -> usize>
+where
+    L: Language,
+    N: Analysis<L>,
+{
+    /// Create a new MinCycleExtractor with default area cost (1 for each node)
+    ///
+    /// Arguments:
+    /// - `egraph`: The e-graph to extract from
+    /// - `is_back_edge`: Returns true for nodes that represent backward edges (ctrl_mov)
+    ///                   These backward edges are used for cycle detection.
+    pub fn new<G>(egraph: &'a EGraph<L, N>, is_back_edge: G) -> MinCycleExtractor<'a, L, N, fn(&L) -> usize>
+    where
+        G: Fn(&L) -> bool + Clone,
+    {
+        fn default_area<L>(_node: &L) -> usize { 1 }
+        MinCycleExtractor::new_with_area(egraph, is_back_edge, default_area as fn(&L) -> usize)
     }
 }
 
@@ -853,6 +906,133 @@ mod tests {
         assert_eq!(cost_a.cycle_node_count, 1);
         assert_eq!(cost_b.cycle_node_count, 2);
         assert_eq!(cost_c.cycle_node_count, 2); // inherits from b, but c itself doesn't add
+    }
+
+    #[test]
+    fn test_two_phase_extraction_with_area() {
+        // Test two-phase extraction: 
+        // Phase 1: minimize cycle nodes
+        // Phase 2: minimize area for non-cycle nodes
+        let mut egraph = EGraph::<SymbolLang, ()>::default();
+        
+        // Create a graph with:
+        // - A cycle: a -> b, ctrl_mov(b, a)
+        // - Two equivalent paths OUTSIDE the cycle:
+        //   - Path 1: c (depends on b), area = 10
+        //   - Path 2: d (depends on b), area = 5
+        
+        // Build the cycle
+        let a = egraph.add(SymbolLang::leaf("a"));
+        let b = egraph.add(SymbolLang::new("op", vec![a]));
+        let _ctrl = egraph.add(SymbolLang::new("ctrl_mov", vec![b, a]));
+        
+        // Two equivalent paths outside the cycle
+        let c = egraph.add(SymbolLang::new("expensive", vec![b])); // area = 10
+        let d = egraph.add(SymbolLang::new("cheap", vec![b]));     // area = 5
+        
+        // Make c and d equivalent
+        egraph.union(c, d);
+        egraph.rebuild();
+        
+        // Define area function: "expensive" has area 10, "cheap" has area 5, others have area 1
+        let area_fn = |node: &SymbolLang| -> usize {
+            match node.op.as_str() {
+                "expensive" => 10,
+                "cheap" => 5,
+                _ => 1,
+            }
+        };
+        
+        let extractor = MinCycleExtractor::new_with_area(&egraph, is_back_edge, area_fn);
+        
+        // Check that c (or its canonical) is NOT on cycle
+        println!("c on cycle: {}", extractor.is_on_cycle(c));
+        assert!(!extractor.is_on_cycle(c), "c should NOT be on cycle");
+        
+        let (cost, expr) = extractor.find_best(c);
+        
+        println!("Best expression: {}", expr);
+        println!("Cost: cycle_node_count={}, off_cycle_area={}, ast_size={}", 
+                 cost.cycle_node_count, cost.off_cycle_area, cost.ast_size);
+        
+        // Should choose "cheap" (area=5) over "expensive" (area=10)
+        // because both have the same cycle_node_count (from dependencies)
+        // but "cheap" has lower area
+        let expr_str = expr.to_string();
+        assert!(expr_str.contains("cheap"), 
+                "Should choose 'cheap' (area=5) over 'expensive' (area=10), got: {}", expr_str);
+        
+        // off_cycle_area should include only non-cycle nodes
+        // a and b are on cycle (area not counted)
+        // cheap node has area 5
+        assert_eq!(cost.off_cycle_area, 5, "off_cycle_area should be 5 (just the cheap node)");
+    }
+
+    #[test]
+    fn test_cycle_nodes_fixed_then_area_optimized() {
+        // Test that cycle node selection is fixed first, then area is optimized
+        let mut egraph = EGraph::<SymbolLang, ()>::default();
+        
+        // Scenario:
+        // - Two equivalent expressions for a cycle
+        // - One cycle path has fewer nodes but expensive non-cycle deps
+        // - One cycle path has more nodes but cheap non-cycle deps
+        // - Should prefer fewer cycle nodes even if area is higher
+        
+        // Build two cycle options:
+        // Option 1: small_cycle (1 node on cycle) -> expensive_dep (area=100)
+        // Option 2: big_cycle (2 nodes on cycle) -> cheap_dep (area=1)
+        
+        let x = egraph.add(SymbolLang::leaf("x"));
+        
+        // Small cycle: x -> small_op, ctrl_mov back to x
+        let small_op = egraph.add(SymbolLang::new("small_op", vec![x]));
+        let _ctrl1 = egraph.add(SymbolLang::new("ctrl_mov", vec![small_op, x]));
+        
+        // Expensive non-cycle node depending on small_op
+        let expensive = egraph.add(SymbolLang::new("expensive", vec![small_op]));
+        
+        // Big cycle: x -> big_op1 -> big_op2, ctrl_mov back to x
+        let y = egraph.add(SymbolLang::leaf("y"));
+        let big_op1 = egraph.add(SymbolLang::new("big_op1", vec![y]));
+        let big_op2 = egraph.add(SymbolLang::new("big_op2", vec![big_op1]));
+        let _ctrl2 = egraph.add(SymbolLang::new("ctrl_mov", vec![big_op2, y]));
+        
+        // Cheap non-cycle node depending on big_op2
+        let cheap = egraph.add(SymbolLang::new("cheap", vec![big_op2]));
+        
+        // Make the final results equivalent
+        let result1 = egraph.add(SymbolLang::new("result", vec![expensive]));
+        let result2 = egraph.add(SymbolLang::new("result", vec![cheap]));
+        egraph.union(result1, result2);
+        egraph.rebuild();
+        
+        // Define area function
+        let area_fn = |node: &SymbolLang| -> usize {
+            match node.op.as_str() {
+                "expensive" => 100,
+                "cheap" => 1,
+                _ => 1,
+            }
+        };
+        
+        let extractor = MinCycleExtractor::new_with_area(&egraph, is_back_edge, area_fn);
+        let (cost, expr) = extractor.find_best(result1);
+        
+        println!("Best expression: {}", expr);
+        println!("Cost: cycle_node_count={}, off_cycle_area={}, ast_size={}", 
+                 cost.cycle_node_count, cost.off_cycle_area, cost.ast_size);
+        
+        // Should choose the path with FEWER cycle nodes (small cycle)
+        // even though it has higher area (expensive=100)
+        // because cycle_node_count has higher priority than off_cycle_area
+        let expr_str = expr.to_string();
+        
+        // The small cycle has 2 nodes on cycle: x, small_op
+        // The big cycle has 3 nodes on cycle: y, big_op1, big_op2
+        // So we should prefer the small cycle
+        assert!(expr_str.contains("small_op"), 
+                "Should choose small cycle (fewer cycle nodes) even with expensive area, got: {}", expr_str);
     }
 }
 
