@@ -37,6 +37,7 @@ pub mod test;
 
 pub mod tutorials;
 
+mod cycle_extract;
 mod dot;
 mod eclass;
 mod egraph;
@@ -88,6 +89,7 @@ impl std::fmt::Display for Id {
 pub(crate) use {explain::Explain, unionfind::UnionFind};
 
 pub use {
+    cycle_extract::{CycleCost, CycleCostFunction, CycleExtractor, CycleInfo, MinCycleExtractor},
     dot::Dot,
     eclass::EClass,
     egraph::{EGraph, LanguageMapper, SimpleLanguageMapper},
