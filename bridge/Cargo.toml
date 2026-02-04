@@ -1,0 +1,15 @@
+[package]
+name = "egg-bridge"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+# Reference to the parent egg crate
+egg = { path = ".." }
+ordered-float = "3.9"
+
+[build-dependencies]
+cbindgen = "0.26"

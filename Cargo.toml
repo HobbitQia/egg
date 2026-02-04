@@ -1,3 +1,6 @@
+[workspace]
+members = ["bridge"]
+
 [package]
 authors = ["Max Willsey <me@mwillsey.com>"]
 categories = ["data-structures"]
